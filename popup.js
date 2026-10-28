@@ -379,7 +379,7 @@ function makeTitleGroups(tabs, embeddings, centeredScores, openTimes) {
   }
 
   lastUngroupedTabs = mergedSegments.filter((group) => group.tabIds.length === 1)
-    .map((group) => ({ title: group.titles[0], index: orderedTabs.find((tab) => tab.id === group.tabIds[0])?.index ?? 0 }));
+    .map((group) => ({ id: group.tabIds[0], title: group.titles[0], index: orderedTabs.find((tab) => tab.id === group.tabIds[0])?.index ?? 0 }));
   lastGroupingDiagnostics = {
     tabCount: orderedTabs.length,
     embeddedCount: orderedTabs.filter((tab) => embeddings.has(tab.id)).length,
@@ -589,6 +589,39 @@ async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = 
     const { vectors: embeddings, centered: centeredScores } = centerEmbeddingVectors(rawEmbeddings);
     proposedTitleGroups = makeTitleGroups(tabs, embeddings, centeredScores, openTimes);
 
+    // This is deliberately a post-processing rule for leftover single tabs;
+    // it cannot alter the normal segmentation or split an established group.
+    const rawTitleVectors = new Map(analyzableTabs.map((tab, index) => [tab.id, titleVectors[index]]));
+    const tabPositionById = new Map(analyzableTabs.map((tab) => [tab.id, tab.index]));
+    const meanTitleVector = (group) => {
+      const vectors = group.tabIds.map((id) => rawTitleVectors.get(id)).filter(Boolean);
+      if (!vectors.length) return null;
+      const mean = vectors[0].map((_, dimension) => vectors.reduce((sum, vector) => sum + vector[dimension] / vectors.length, 0));
+      const norm = Math.sqrt(mean.reduce((sum, value) => sum + value * value, 0));
+      return norm > 1e-8 ? mean.map((value) => value / norm) : null;
+    };
+    const attachedSingletonIds = new Set();
+    for (const singleton of lastUngroupedTabs) {
+      const vector = rawTitleVectors.get(singleton.id);
+      if (!vector) continue;
+      const candidates = proposedTitleGroups.map((group) => ({
+        group,
+        similarity: cosineSimilarity(vector, meanTitleVector(group)),
+        distance: Math.min(...group.tabIds.map((id) => Math.abs(singleton.index - (tabPositionById.get(id) ?? singleton.index))))
+      })).filter((candidate) => candidate.similarity > 0.90)
+        .sort((left, right) => left.distance - right.distance || right.similarity - left.similarity);
+      const best = candidates[0];
+      if (!best) continue;
+      const entries = [...best.group.tabIds.map((id, index) => ({ id, title: best.group.titles[index] })),
+        { id: singleton.id, title: singleton.title }]
+        .sort((left, right) => (tabPositionById.get(left.id) ?? 0) - (tabPositionById.get(right.id) ?? 0));
+      best.group.tabIds = entries.map((entry) => entry.id);
+      best.group.titles = entries.map((entry) => entry.title);
+      best.group.attachedCount = (best.group.attachedCount || 0) + 1;
+      attachedSingletonIds.add(singleton.id);
+    }
+    lastUngroupedTabs = lastUngroupedTabs.filter((tab) => !attachedSingletonIds.has(tab.id));
+
     if (lastUngroupedTabs.length > 0) {
       const note = document.createElement("p");
       note.textContent = `Einzeltabs bleiben ungegruppiert: ${lastUngroupedTabs.map((tab) => tab.title).join(" · ")}`;
@@ -619,7 +652,7 @@ async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = 
       label.htmlFor = `group-name-${index}`;
       label.textContent = group.tabIds.length === 1
         ? "Einzeltab"
-        : `Gruppenname · ${group.tabIds.length} Tabs${group.includedBetween ? ` · ${group.includedBetween} dazwischenliegend` : ""}`;
+        : `Gruppenname · ${group.tabIds.length} Tabs${group.includedBetween ? ` · ${group.includedBetween} dazwischenliegend` : ""}${group.attachedCount ? ` · ${group.attachedCount} Einzeltabs >90 % ergänzt` : ""}`;
       const input = document.createElement("input");
       input.id = `group-name-${index}`;
       input.className = "group-name-input";
