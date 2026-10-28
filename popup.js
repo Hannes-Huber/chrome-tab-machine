@@ -120,6 +120,30 @@ function temporalSimilarity(leftId, rightId, openTimes) {
   return Math.exp(-elapsed / OPEN_TIME_HALF_LIFE_MS) * confidence;
 }
 
+function tabDomain(tab) {
+  try {
+    return new URL(tab.url).hostname.toLocaleLowerCase().replace(/^www\./, "") || null;
+  } catch {
+    return null;
+  }
+}
+
+function buildDomainProfiles(tabs, pageSummaries) {
+  const pagesByDomain = new Map();
+  for (const tab of tabs) {
+    const domain = tabDomain(tab);
+    if (!domain) continue;
+    const pages = pagesByDomain.get(domain) || [];
+    const pageText = `${tab.title || ""}. ${pageSummaries.get(tab.id) || ""}`.replace(/\s+/g, " ").trim();
+    if (pageText && !pages.includes(pageText)) pages.push(pageText);
+    pagesByDomain.set(domain, pages);
+  }
+  return new Map([...pagesByDomain].map(([domain, pages]) => {
+    const samples = pages.slice(0, 6).map((page) => page.slice(0, 420));
+    return [domain, `Website domain ${domain.replace(/[.-]/g, " ")}. Open pages and their topics: ${samples.join(". ")}`.slice(0, 3000)];
+  }));
+}
+
 function groupsShareDistinctTitleTerms(leftGroup, rightGroup, termFrequency, corpusSize, openTimes) {
   for (let leftIndex = 0; leftIndex < leftGroup.titles.length; leftIndex += 1) {
     for (let rightIndex = 0; rightIndex < rightGroup.titles.length; rightIndex += 1) {
@@ -369,34 +393,71 @@ function makeTitleGroups(tabs, embeddings, centeredScores, openTimes) {
   return mergedSegments.filter((group) => group.tabIds.length > 1);
 }
 
-function extractPageContext() {
+function extractPageContext(hintTerms = []) {
   const clean = (value, maxLength) => (value || "").replace(/\s+/g, " ").trim().slice(0, maxLength);
   const description = document.querySelector('meta[name="description"], meta[property="og:description"]')?.content || "";
   const headings = [...document.querySelectorAll("h1, h2")]
-    .slice(0, 4)
-    .map((heading) => clean(heading.textContent, 90))
+    .slice(0, 6)
+    .map((heading) => clean(heading.textContent, 60))
     .filter(Boolean)
     .join(" ");
   const root = document.querySelector("main, article, [role='main']") || document.body;
+  const relevantLinks = [];
+  const otherLinks = [];
+  if (root) {
+    let order = 0;
+    let scannedLinks = 0;
+    const hints = new Set(hintTerms.map((term) => term.toLocaleLowerCase()));
+    for (const link of root.querySelectorAll("a")) {
+      if (scannedLinks >= 300) break;
+      scannedLinks += 1;
+      if (link.closest("script, style, noscript, nav, footer, header, aside, form, [hidden], [aria-hidden='true']")) continue;
+      const label = clean(link.textContent || link.getAttribute("aria-label") || link.title, 55);
+      if (!label) continue;
+      const labelTerms = new Set(label.toLocaleLowerCase().match(/[\p{L}\p{N}]{4,}/gu) || []);
+      const relevance = [...hints].filter((term) => labelTerms.has(term)).length;
+      if ((relevance && relevantLinks.length < 32) || (!relevance && otherLinks.length < 16)) {
+        if (link.getClientRects().length === 0) continue;
+        const entry = { label, relevance, order };
+        (relevance ? relevantLinks : otherLinks).push(entry);
+      }
+      order += 1;
+    }
+  }
+  relevantLinks.sort((left, right) => right.relevance - left.relevance || left.order - right.order);
+  const linkLabels = [];
+  let linkTextLength = 0;
+  for (const { label } of [...relevantLinks, ...otherLinks]) {
+    if (linkLabels.includes(label)) continue;
+    if (linkTextLength + label.length > 300) continue;
+    linkLabels.push(label);
+    linkTextLength += label.length;
+    if (linkLabels.length >= 8) break;
+  }
   let visibleSample = "";
   if (root) {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode() && visibleSample.length < 450) {
+    let visitedTextNodes = 0;
+    while (walker.nextNode() && visibleSample.length < 180 && visitedTextNodes < 40) {
+      visitedTextNodes += 1;
       const node = walker.currentNode;
       const parent = node.parentElement;
       if (!parent || parent.closest("script, style, noscript, nav, footer, header, aside, form, [hidden], [aria-hidden='true']")) continue;
       if (parent.getClientRects().length === 0) continue;
-      const text = clean(node.nodeValue, 450 - visibleSample.length);
+      const text = clean(node.nodeValue, 180 - visibleSample.length);
       if (text) visibleSample += `${visibleSample ? " " : ""}${text}`;
     }
   }
-  return [clean(description, 180), clean(headings, 240), clean(visibleSample, 450)]
+  return [clean(description, 150), clean(headings, 200), clean(linkLabels.join(" "), 300), clean(visibleSample, 180)]
     .filter(Boolean)
     .join(" ")
     .slice(0, 850);
 }
 
-async function readPageContexts(tabs) {
+async function readPageContexts(tabs, onProgress) {
+  const hintTerms = [...new Set(tabs.flatMap((tab) =>
+    (tab.title || "").normalize("NFKC").toLocaleLowerCase().match(/[\p{L}\p{N}]{4,}/gu) || []
+  ))].slice(0, 80);
   const readableTabs = tabs.filter((tab) => {
     try {
       const url = new URL(tab.url);
@@ -405,15 +466,36 @@ async function readPageContexts(tabs) {
       return false;
     }
   });
-  const results = await Promise.all(readableTabs.map(async (tab) => {
-    try {
-      const injected = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extractPageContext });
-      return [tab.id, typeof injected[0]?.result === "string" ? injected[0].result : ""];
-    } catch {
-      return [tab.id, ""];
-    }
-  }));
-  return new Map(results.filter(([, context]) => context));
+  const results = [];
+  const batchSize = 8;
+  let timedOutCount = 0;
+  for (let start = 0; start < readableTabs.length; start += batchSize) {
+    const batch = readableTabs.slice(start, start + batchSize);
+    const batchResults = await Promise.all(batch.map(async (tab) => {
+      let timerId;
+      try {
+        const injection = chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: extractPageContext,
+          args: [hintTerms]
+        }).then((injected) => typeof injected[0]?.result === "string" ? injected[0].result : "").catch(() => "");
+        const context = await Promise.race([
+          injection,
+          new Promise((resolve) => { timerId = setTimeout(() => resolve(null), 2000); })
+        ]);
+        const timedOut = context === null;
+        if (timedOut) timedOutCount += 1;
+        return [tab.id, timedOut ? "" : context, timedOut];
+      } catch {
+        return [tab.id, "", false];
+      } finally {
+        clearTimeout(timerId);
+      }
+    }));
+    results.push(...batchResults);
+    onProgress?.(Math.min(start + batchSize, readableTabs.length), readableTabs.length, timedOutCount);
+  }
+  return new Map(results.filter(([, context]) => context).map(([id, context]) => [id, context]));
 }
 
 function beginTitleAnalysis() {
@@ -460,12 +542,22 @@ async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = 
   applyGroupsButton.disabled = true;
   analyzeTitlesButton.disabled = true;
   try {
-    const pageSummaries = canReadPages ? await readPageContexts(tabs) : new Map();
+    const pageSummaries = canReadPages
+      ? await readPageContexts(tabs, (completed, total, skipped) => {
+        groupingStatus.textContent = `Lese Seitenproben: ${completed}/${total}${skipped ? ` · ${skipped} langsame Seiten übersprungen` : ""} …`;
+      })
+      : new Map();
+    groupingStatus.textContent = "Erstelle lokale Domainprofile und lade das Modell …";
     const openTimes = await getTabOpenTimes(tabs, canReadHistory);
     const analyzableTabs = tabs.filter((tab) => !tab.pinned && tab.title && typeof tab.id === "number");
+    const domainProfiles = buildDomainProfiles(analyzableTabs, pageSummaries);
     const updateModelProgress = (event) => {
-      if (event.status === "progress" && Number.isFinite(event.progress)) {
+      if (event.status === "initiate") {
+        groupingStatus.textContent = `Lade Modelldatei${event.file ? ` ${event.file}` : ""} …`;
+      } else if (event.status === "progress" && Number.isFinite(event.progress)) {
         groupingStatus.textContent = `Lade lokales Modell: ${Math.round(event.progress)}% …`;
+      } else if (event.status === "done") {
+        groupingStatus.textContent = "Lokales Modell geladen; erstelle Vektoren …";
       } else if (event.status === "embedding") {
         groupingStatus.textContent = `Vergleiche semantisch passende Seiten: ${event.completed}/${event.total} …`;
       }
@@ -479,16 +571,18 @@ async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = 
     const titleVectors = analyzableTabs.length
       ? await embedTexts(analyzableTabs.map((tab) => tab.title), updateModelProgress)
       : [];
-    const contextTabs = analyzableTabs.filter((tab) => pageSummaries.has(tab.id));
-    const contextVectors = contextTabs.length
-      ? await embedTexts(contextTabs.map((tab) => pageSummaries.get(tab.id)), updateModelProgress)
+    const domainProfileEntries = [...domainProfiles.entries()];
+    const domainProfileVectors = domainProfileEntries.length
+      ? await embedTexts(domainProfileEntries.map(([, profile]) => profile), updateModelProgress)
       : [];
-    const contextByTab = new Map(contextTabs.map((tab, index) => [tab.id, contextVectors[index]]));
+    const profileByDomain = new Map(domainProfileEntries.map(([domain], index) => [domain, domainProfileVectors[index]]));
     const rawEmbeddings = new Map(analyzableTabs.map((tab, index) => {
       const titleVector = titleVectors[index];
-      const contextVector = contextByTab.get(tab.id);
-      if (!contextVector) return [tab.id, titleVector];
-      const combined = titleVector.map((value, dimension) => value * 0.95 + contextVector[dimension] * 0.05);
+      const profileVector = profileByDomain.get(tabDomain(tab));
+      const profileWeight = pageSummaries.size > 0 ? 0.18 : 0.10;
+      const titleWeight = 1 - profileWeight;
+      const combined = titleVector.map((value, dimension) => value * titleWeight
+        + (profileVector ? profileVector[dimension] * profileWeight : 0));
       const norm = Math.sqrt(combined.reduce((sum, value) => sum + value * value, 0)) || 1;
       return [tab.id, combined.map((value) => value / norm)];
     }));
@@ -504,8 +598,8 @@ async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = 
     const groupedCount = proposedTitleGroups.reduce((sum, group) => sum + group.tabIds.length, 0);
     const pinnedCount = tabs.filter((tab) => tab.pinned).length;
     const contextNote = canReadPages
-      ? `${pageSummaries.size} kurze Seitenproben plus Seitentitel lokal analysiert`
-      : "nur Seitentitel verwendet (Seitenzugriff nicht erteilt)";
+      ? `${domainProfiles.size} Domainprofile aus Titeln und ${pageSummaries.size} kurzen Seitenproben lokal analysiert`
+      : `${domainProfiles.size} Domainprofile aus offenen Seitentiteln lokal analysiert (kein Seitenzugriff)`;
     const observedOpenTimes = analyzableTabs.filter((tab) => openTimes.get(tab.id)?.confidence >= 1).length;
     const historyOpenTimes = analyzableTabs.filter((tab) => openTimes.get(tab.id)?.confidence === 0.8).length;
     const approximateOpenTimes = analyzableTabs.length - observedOpenTimes - historyOpenTimes;
