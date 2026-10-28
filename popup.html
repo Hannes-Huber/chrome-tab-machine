@@ -14,6 +14,16 @@
         <p class="intro">Such-Tabs und File-Storage-Seiten prüfen und auswählen, welche geöffnet bleiben.</p>
       </header>
 
+      <section class="grouping-tool" aria-labelledby="groupingTitle">
+        <h2 id="groupingTitle">Tabs thematisch gruppieren</h2>
+        <p class="section-intro">Vergleicht Seitentitel und – nach deiner Freigabe – kleine Textproben offener Seiten. Pro Seite werden höchstens 850 Zeichen lokal ausgewertet; nichts wird übertragen. Ohne Freigabe werden nur Titel genutzt.</p>
+        <button id="analyzeTitles" class="secondary wide-button" type="button" disabled>Titel und Seitenkontext analysieren</button>
+        <div id="groupingStatus" class="status" role="status" aria-live="polite"></div>
+        <section id="titleGroups" aria-label="Vorgeschlagene Tab-Gruppen"></section>
+        <div id="ungroupedTabs" class="ungrouped-tabs"></div>
+        <button id="applyGroups" class="primary wide-button" type="button" disabled>Vorgeschlagene Gruppen anwenden</button>
+      </section>
+
       <div id="searchStatus" class="status" role="status" aria-live="polite">Such-Tabs werden geprüft …</div>
       <section id="searchResults" aria-label="Suchbegriffe"></section>
 

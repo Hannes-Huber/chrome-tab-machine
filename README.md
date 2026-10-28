@@ -1,6 +1,10 @@
-# Such-Tabs & File-Storage-Tabs
+# Tab Organizer
 
-Eine Manifest-V3-Erweiterung für Google Chrome und Brave. Die Prüfung läuft lokal; die Erweiterung sendet keine Daten an Server.
+Eine Manifest-V3-Erweiterung für Google Chrome und Brave. Die Auswertungen laufen lokal; die Erweiterung sendet keine Daten an Server.
+
+## Tabs thematisch gruppieren
+
+Die Gruppierung bezieht sich auf Tabs im aktuellen Browserfenster. Sie vergleicht ausschließlich Seitentitel, nicht Seiteninhalte, URLs oder Domains. Ein lokaler TF-IDF-/Cosinus-Ähnlichkeitsvergleich wird durch Themenbegriffe ergänzt. Direkte Nachbarn erhalten den höchsten Einfluss; der Einfluss weiter entfernter Titel sinkt mit der Tab-Distanz. Eine starke entfernte Beziehung kann eine lokale Grenze überstimmen, wenn ihr gewichteter Einfluss größer ist. Tabs zwischen solchen Ankern werden Teil desselben Bereichs. So können beispielsweise eine Stellenausschreibung für 3D Artists und ein Unreal-Engine-Tutorial samt dazwischenliegenden Tabs gemeinsam gruppiert werden, sofern ihre gewichtete Beziehung stärker bleibt. Sonst beginnt an der unpassenden Nachbarschaft ein neuer Bereich. Vorschläge zeigen Themenbezug und einstellbare Gruppennamen; auch einzelne Tabs werden als eigene Bereiche vorgeschlagen. Angeheftete Tabs bleiben außerhalb. Beim Anwenden werden bestehende Gruppen der neu zugeordneten Tabs ersetzt. Es wird kein KI-Dienst oder Netzwerkzugriff verwendet.
 
 ## Such-Tabs verwalten
 
@@ -26,4 +30,4 @@ Die Duplikatprüfung gruppiert Tabs mit derselben vollständigen URL. Weitere Ta
 
 ## Berechtigung
 
-Die Erweiterung benötigt `tabs`, um Tab-URLs und Titel in allen Fenstern zu lesen und ausgewählte Tabs zu schließen. Browserinterne Tabs und Tabs, deren URL der Browser nicht offenlegt, können nicht ausgewertet werden.
+Die Erweiterung benötigt `tabs`, um Tab-URLs und Titel zu lesen und ausgewählte Tabs zu schließen, sowie `tabGroups`, um Tab-Gruppen zu erstellen und zu benennen. Für die thematische Gruppierung wird nur der Seitentitel verwendet. Browserinterne Tabs und Tabs, deren URL der Browser nicht offenlegt, können von den Such-, Storage- und Duplikatprüfungen nicht ausgewertet werden.
