@@ -14,6 +14,7 @@ const duplicateResults = document.querySelector("#duplicateResults");
 const closeDuplicatesButton = document.querySelector("#closeDuplicates");
 const rescanButton = document.querySelector("#rescan");
 const analyzeTitlesButton = document.querySelector("#analyzeTitles");
+const analysisSpinner = document.querySelector("#analysisSpinner");
 const groupingStatus = document.querySelector("#groupingStatus");
 const titleGroupsContainer = document.querySelector("#titleGroups");
 const ungroupedTabsContainer = document.querySelector("#ungroupedTabs");
@@ -25,6 +26,12 @@ let lastUngroupedTabs = [];
 let lastGroupingBoundaryCount = 0;
 let lastGroupingDiagnostics = { tabCount: 0, embeddedCount: 0, strongestAdjacent: 0 };
 analyzeTitlesButton.disabled = true;
+
+function setAnalysisLoading(isLoading) {
+  analysisSpinner.hidden = !isLoading;
+  analyzeTitlesButton.disabled = isLoading;
+  analyzeTitlesButton.setAttribute("aria-busy", String(isLoading));
+}
 
 const OPENED_AT_KEY = "tabOpenedAtById";
 const OPEN_TIME_HALF_LIFE_MS = 8 * 60 * 1000;
@@ -511,8 +518,8 @@ function beginTitleAnalysis() {
 
   // Ask only after the user's click. History data is queried only for URLs
   // already open in this window; page access stays optional as before.
-  groupingStatus.textContent = "Bitte bestätige optional den Verlaufs- und Website-Zugriff für diese Analyse …";
-  analyzeTitlesButton.disabled = true;
+  groupingStatus.textContent = "";
+  setAnalysisLoading(true);
   const permissions = origins.length > 0 ? ["history", "scripting"] : ["history"];
   const permissionRequest = new Promise((resolve, reject) => {
     chrome.permissions.request({ permissions, ...(origins.length ? { origins } : {}) }, (granted) => {
@@ -534,34 +541,20 @@ function beginTitleAnalysis() {
 }
 
 async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = false) {
-  groupingStatus.textContent = canReadPages
-    ? "Kurze Seitenkontexte werden gelesen; das lokale mehrsprachige Modell wird vorbereitet …"
-    : "Das lokale mehrsprachige Modell wird mit den Seitentiteln vorbereitet …";
+  groupingStatus.textContent = "";
+  setAnalysisLoading(true);
   titleGroupsContainer.replaceChildren();
   ungroupedTabsContainer.replaceChildren();
   applyGroupsButton.disabled = true;
   analyzeTitlesButton.disabled = true;
   try {
     const pageSummaries = canReadPages
-      ? await readPageContexts(tabs, (completed, total, skipped) => {
-        groupingStatus.textContent = `Lese Seitenproben: ${completed}/${total}${skipped ? ` · ${skipped} langsame Seiten übersprungen` : ""} …`;
-      })
+      ? await readPageContexts(tabs)
       : new Map();
-    groupingStatus.textContent = "Erstelle lokale Domainprofile und lade das Modell …";
     const openTimes = await getTabOpenTimes(tabs, canReadHistory);
     const analyzableTabs = tabs.filter((tab) => !tab.pinned && tab.title && typeof tab.id === "number");
     const domainProfiles = buildDomainProfiles(analyzableTabs, pageSummaries);
-    const updateModelProgress = (event) => {
-      if (event.status === "initiate") {
-        groupingStatus.textContent = `Lade Modelldatei${event.file ? ` ${event.file}` : ""} …`;
-      } else if (event.status === "progress" && Number.isFinite(event.progress)) {
-        groupingStatus.textContent = `Lade lokales Modell: ${Math.round(event.progress)}% …`;
-      } else if (event.status === "done") {
-        groupingStatus.textContent = "Lokales Modell geladen; erstelle Vektoren …";
-      } else if (event.status === "embedding") {
-        groupingStatus.textContent = `Vergleiche semantisch passende Seiten: ${event.completed}/${event.total} …`;
-      }
-    };
+    const updateModelProgress = () => {};
     if (analyzableTabs.length === 0) {
       proposedTitleGroups = [];
       lastUngroupedTabs = [];
@@ -622,29 +615,11 @@ async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = 
     }
     lastUngroupedTabs = lastUngroupedTabs.filter((tab) => !attachedSingletonIds.has(tab.id));
 
-    if (lastUngroupedTabs.length > 0) {
-      const note = document.createElement("p");
-      note.textContent = `Einzeltabs bleiben ungegruppiert: ${lastUngroupedTabs.map((tab) => tab.title).join(" · ")}`;
-      ungroupedTabsContainer.append(note);
-    }
-
     const groupedCount = proposedTitleGroups.reduce((sum, group) => sum + group.tabIds.length, 0);
     const pinnedCount = tabs.filter((tab) => tab.pinned).length;
-    const contextNote = canReadPages
-      ? `${domainProfiles.size} Domainprofile aus Titeln und ${pageSummaries.size} kurzen Seitenproben lokal analysiert`
-      : `${domainProfiles.size} Domainprofile aus offenen Seitentiteln lokal analysiert (kein Seitenzugriff)`;
-    const observedOpenTimes = analyzableTabs.filter((tab) => openTimes.get(tab.id)?.confidence >= 1).length;
-    const historyOpenTimes = analyzableTabs.filter((tab) => openTimes.get(tab.id)?.confidence === 0.8).length;
-    const approximateOpenTimes = analyzableTabs.length - observedOpenTimes - historyOpenTimes;
-    const timeNote = `${observedOpenTimes} Öffnungszeitpunkte erfasst · ${historyOpenTimes} Verlauf · ${approximateOpenTimes} Näherungen`;
-    const noGroupNote = proposedTitleGroups.length === 0
-      ? `Keine mehrteiligen Gruppen erkannt (${lastGroupingDiagnostics.embeddedCount}/${lastGroupingDiagnostics.tabCount} Tabs eingebettet; stärkste Nachbarähnlichkeit ${Math.round(lastGroupingDiagnostics.strongestAdjacent * 100)}%, Schwelle ${Math.round((lastGroupingDiagnostics.directThreshold || 0.6) * 100)}%). `
-      : "";
-    const singleGroupDiagnostic = proposedTitleGroups.length === 1
-      ? ` · Übergänge: ${lastGroupingDiagnostics.localMatchCount} direkte, ${lastGroupingDiagnostics.remoteOverrideCount} entfernte; Nachbarwerte ${Math.round(lastGroupingDiagnostics.weakestAdjacent * 100)}–${Math.round(lastGroupingDiagnostics.strongestAdjacent * 100)}%`
-      : "";
-    const singleNote = lastUngroupedTabs.length ? ` · ${lastUngroupedTabs.length} Einzeltabs ungegruppiert` : "";
-    groupingStatus.textContent = `${noGroupNote}${proposedTitleGroups.length} Gruppen für ${groupedCount} Tabs · ${lastGroupingBoundaryCount} Grenze${lastGroupingBoundaryCount === 1 ? "" : "n"}${singleNote}${singleGroupDiagnostic} · ${contextNote} · ${timeNote}${pinnedCount ? ` · ${pinnedCount} angeheftete Tabs bleiben außerhalb` : ""}`;
+    groupingStatus.textContent = proposedTitleGroups.length
+      ? `${proposedTitleGroups.length} Gruppen für ${groupedCount} Tabs vorgeschlagen${pinnedCount ? ` · ${pinnedCount} angeheftete Tabs bleiben außerhalb` : ""}.`
+      : "Keine Gruppen vorgeschlagen.";
     proposedTitleGroups.forEach((group, index) => {
       const card = document.createElement("article");
       card.className = "suggested-group";
@@ -679,7 +654,7 @@ async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = 
     groupingStatus.textContent = `Analyse fehlgeschlagen: ${reason.slice(0, 220)}`;
     console.error("Title-based grouping failed:", error);
   } finally {
-    analyzeTitlesButton.disabled = false;
+    setAnalysisLoading(false);
   }
 }
 
