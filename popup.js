@@ -1,3 +1,5 @@
+import { embedTexts } from "./semantic.js";
+
 const searchStatus = document.querySelector("#searchStatus");
 const searchResults = document.querySelector("#searchResults");
 const closeSearchButton = document.querySelector("#closeSearch");
@@ -21,94 +23,63 @@ let proposedTitleGroups = [];
 let currentWindowSnapshot = [];
 let lastUngroupedTabs = [];
 let lastGroupingBoundaryCount = 0;
+let lastGroupingDiagnostics = { tabCount: 0, embeddedCount: 0, strongestAdjacent: 0 };
 analyzeTitlesButton.disabled = true;
 
-const TITLE_STOPWORDS = new Set((
-  "der die das den dem des ein eine einer einem eines und oder aber fuer fur von vom im in am an auf aus mit ohne ueber unter zu zum zur bei als ist sind war waren wird werden the a an and or but for from of in on at to with without about by is are was were be this that these those your my home page new tab login sign in sign up dashboard startseite"
-).split(/\s+/));
-
-const TITLE_TOPICS = [
-  { id: "game-development", label: "Game Development", patterns: [/\bunreal(?:\s+engine)?\b/, /\bue[45]\b/, /\bunity\b/, /\bgodot\b/, /\bgame\s*(?:dev|development|developer|design|programming|art)\b/, /\bvideo\s*games?\b/, /\b3d\s+artists?\b/, /\blevel\s+design\b/] },
-  { id: "3d-art", label: "3D Art & Modeling", patterns: [/\b3d\s*(?:artist|art|model(?:ing|ling)?|sculpt(?:ing)?)\b/, /\b(?:blender|maya|zbrush|3ds\s*max|substance\s+painter)\b/, /\bcharacter\s+(?:art|modeling|modelling|sculpting)\b/] },
-  { id: "jewelry-engagement", label: "Ringe & Verlobung", patterns: [/\bverlobungsring(?:e|en)?\b/, /\b(?:jewelry|jewellery|schmuck|engagement\s+rings?|wedding\s+rings?|bridal\s+jewelry)\b/, /(?=.*\b(?:engagement|verlobung|wedding|bridal)\b)(?=.*\b(?:ring|jewelry|jewellery|diamond|schmuck)\b)/] },
-  { id: "web-development", label: "Web Development", patterns: [/\b(?:react|angular|vue(?:\.js)?|svelte|next\.js|nuxt|frontend|front\s*end|web\s+development)\b/, /\bhtml\b.*\bcss\b/, /\bjavascript\b/] },
-  { id: "software-development", label: "Software Development", patterns: [/\b(?:software\s+development|programming|coding|developer|python|java|rust|golang|typescript|c\+\+|c#|git|api)\b/] },
-  { id: "ai-ml", label: "AI & Machine Learning", patterns: [/\b(?:artificial\s+intelligence|machine\s+learning|deep\s+learning|neural\s+networks?|llm|generative\s+ai|chatgpt|gpt-[\w.]+)\b/] },
-  { id: "data-science", label: "Data Science", patterns: [/\b(?:data\s+science|data\s+analysis|analytics|pandas|numpy|sql|statistics|visualization)\b/] },
-  { id: "cloud-devops", label: "Cloud & DevOps", patterns: [/\b(?:docker|kubernetes|k8s|aws|azure|google\s+cloud|devops|terraform|cloud\s+computing|ci\/cd)\b/] },
-  { id: "cybersecurity", label: "Cybersecurity", patterns: [/\b(?:cybersecurity|cyber\s+security|infosec|penetration\s+testing|pentest|vulnerability|encryption)\b/] },
-  { id: "career", label: "Jobs & Careers", patterns: [/\b(?:stellenausschreibung(?:en)?|stellenanzeige(?:n)?|job\s+(?:opening|listing|posting)|careers?|hiring|vacanc(?:y|ies)|bewerbung(?:en)?|stellenangebot(?:e)?)\b/] }
-];
-
-function normalizedTitle(title) {
-  return (title || "").normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase();
-}
-
-function titleTopics(title) {
-  const normalized = normalizedTitle(title);
-  return TITLE_TOPICS.filter((topic) => topic.patterns.some((pattern) => pattern.test(normalized)));
+function cosineSimilarity(left, right) {
+  if (!left || !right || left.length !== right.length) return 0;
+  let dot = 0;
+  for (let index = 0; index < left.length; index += 1) dot += left[index] * right[index];
+  return dot;
 }
 
 function titleTokens(title) {
-  return normalizedTitle(title)
-    .match(/[\p{L}\p{N}]+/gu)
-    ?.filter((token) => (token.length > 2 || token === "3d") && !TITLE_STOPWORDS.has(token) && !/^\d+$/.test(token)) ?? [];
+  return new Set((title || "").normalize("NFKC").toLocaleLowerCase()
+    .match(/[\p{L}\p{N}]{3,}/gu) || []);
 }
 
-function titleVectors(tabs, pageSummaries = new Map()) {
-  const documents = tabs.map((tab) => {
-    const analysisText = `${tab.title || ""} ${pageSummaries.get(tab.id) || ""}`.trim();
-    return { tab, tokens: titleTokens(analysisText), topics: titleTopics(analysisText) };
-  });
-  const documentFrequency = new Map();
-  for (const document of documents) {
-    for (const token of new Set(document.tokens)) {
-      documentFrequency.set(token, (documentFrequency.get(token) || 0) + 1);
+function titlesShareDistinctTerms(leftTitle, rightTitle) {
+  const leftTokens = titleTokens(leftTitle);
+  const rightTokens = titleTokens(rightTitle);
+  if (leftTokens.size < 2 || rightTokens.size < 2) return false;
+  const sharedCount = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  return sharedCount >= 2 && sharedCount / Math.min(leftTokens.size, rightTokens.size) >= 0.25;
+}
+
+function groupsShareDistinctTitleTerms(leftGroup, rightGroup) {
+  for (const leftTitle of leftGroup.titles) {
+    for (const rightTitle of rightGroup.titles) {
+      if (titlesShareDistinctTerms(leftTitle, rightTitle)) return true;
     }
   }
-  const idf = new Map([...documentFrequency].map(([token, frequency]) => [
-    token,
-    Math.log(1 + (documents.length + 1) / (frequency + 1))
-  ]));
-  return documents.map((document) => {
-    const counts = new Map();
-    for (const token of document.tokens) counts.set(token, (counts.get(token) || 0) + 1);
-    const vector = new Map([...counts].map(([token, count]) => [
-      token,
-      (count / Math.max(document.tokens.length, 1)) * idf.get(token)
-    ]));
-    const norm = Math.sqrt([...vector.values()].reduce((sum, value) => sum + value * value, 0));
-    return { ...document, vector, norm };
-  });
+  return false;
 }
 
-function titleCosine(left, right) {
-  if (!left.norm || !right.norm) return 0;
-  let dot = 0;
-  for (const [token, value] of left.vector) dot += value * (right.vector.get(token) || 0);
-  return dot / (left.norm * right.norm);
+function centerEmbeddingVectors(embeddings) {
+  if (embeddings.size < 4) return { vectors: embeddings, centered: false };
+  const entries = [...embeddings.entries()];
+  const dimensions = entries[0][1].length;
+  const mean = Array(dimensions).fill(0);
+  for (const [, vector] of entries) {
+    vector.forEach((value, dimension) => { mean[dimension] += value / entries.length; });
+  }
+  const centered = new Map(entries.map(([id, vector]) => {
+    const adjusted = vector.map((value, dimension) => value - mean[dimension]);
+    const norm = Math.sqrt(adjusted.reduce((sum, value) => sum + value * value, 0));
+    return [id, norm > 1e-8 ? adjusted.map((value) => value / norm) : vector];
+  }));
+  return { vectors: centered, centered: true };
 }
 
-function titleTopicSimilarity(left, right) {
-  const rightTopics = new Set(right.topics.map((topic) => topic.id));
-  const leftTopics = new Set(left.topics.map((topic) => topic.id));
-  const shared = [...leftTopics].filter((topic) => rightTopics.has(topic)).length;
-  const smallestTopicSet = Math.min(leftTopics.size, rightTopics.size);
-  return smallestTopicSet ? 0.72 * shared / smallestTopicSet : 0;
-}
-
-function titleAffinity(left, right) {
-  return Math.max(titleCosine(left, right), titleTopicSimilarity(left, right));
-}
-
-function makeTitleGroups(tabs, pageSummaries = new Map()) {
+function makeTitleGroups(tabs, embeddings, centeredScores) {
   const orderedTabs = tabs.filter((tab) => !tab.pinned).sort((left, right) => left.index - right.index);
-  const documents = titleVectors(orderedTabs.filter((tab) => tab.title), pageSummaries);
-  const documentByTabId = new Map(documents.map((document) => [document.tab.id, document]));
   const boundaryAfter = [];
   const anchorsByBoundary = [];
-  const LOCAL_MATCH_THRESHOLD = 0.28;
-  const REMOTE_OVERRIDE_FLOOR = 0.24;
+  const DIRECT_MATCH_THRESHOLD = centeredScores ? 0.34 : 0.60;
+  const REMOTE_AFFINITY_THRESHOLD = centeredScores ? 0.44 : 0.68;
+  const REMOTE_OVERRIDE_FLOOR = centeredScores ? 0.22 : 0.32;
+  const REMOTE_WIN_MARGIN = centeredScores ? 0.04 : 0.05;
+  let strongestAdjacent = 0;
   const boundaryCount = Math.max(0, orderedTabs.length - 1);
   let treeSize = 1;
   while (treeSize < boundaryCount) treeSize *= 2;
@@ -147,14 +118,17 @@ function makeTitleGroups(tabs, pageSummaries = new Map()) {
   // Each remote title pair contributes a distance-weighted influence to every
   // boundary it spans. Range-max updates avoid cubic work on large tab strips.
   for (let left = 0; left < orderedTabs.length; left += 1) {
-    const first = documentByTabId.get(orderedTabs[left].id);
+    const first = embeddings.get(orderedTabs[left].id);
     if (!first) continue;
     for (let right = left + 2; right < orderedTabs.length; right += 1) {
-      const second = documentByTabId.get(orderedTabs[right].id);
+      const second = embeddings.get(orderedTabs[right].id);
       if (!second) continue;
-      const influence = titleAffinity(first, second) / Math.sqrt(right - left);
+      const hasSharedTerms = titlesShareDistinctTerms(orderedTabs[left].title, orderedTabs[right].title);
+      const affinity = Math.max(cosineSimilarity(first, second), hasSharedTerms ? 0.82 : 0);
+      if (affinity < REMOTE_AFFINITY_THRESHOLD) continue;
+      const influence = affinity / Math.sqrt(right - left);
       if (influence > 0) {
-        updateRemoteRange(left, right - 1, { influence, tabIds: [first.tab.id, second.tab.id] });
+        updateRemoteRange(left, right - 1, { influence, affinity, tabIds: [orderedTabs[left].id, orderedTabs[right].id] });
       }
     }
   }
@@ -162,13 +136,18 @@ function makeTitleGroups(tabs, pageSummaries = new Map()) {
   for (let boundary = 0; boundary < orderedTabs.length - 1; boundary += 1) {
     const leftTab = orderedTabs[boundary];
     const rightTab = orderedTabs[boundary + 1];
-    const leftDoc = documentByTabId.get(leftTab.id);
-    const rightDoc = documentByTabId.get(rightTab.id);
-    const localInfluence = leftDoc && rightDoc ? titleAffinity(leftDoc, rightDoc) : 0;
+    const leftVector = embeddings.get(leftTab.id);
+    const rightVector = embeddings.get(rightTab.id);
+    const hasSharedTerms = titlesShareDistinctTerms(leftTab.title, rightTab.title);
+    const localInfluence = Math.max(
+      leftVector && rightVector ? cosineSimilarity(leftVector, rightVector) : 0,
+      hasSharedTerms ? 0.82 : 0
+    );
+    strongestAdjacent = Math.max(strongestAdjacent, localInfluence);
     const strongestRemote = remoteInfluenceAt(boundary);
 
-    const remoteOverrides = strongestRemote.influence > Math.max(localInfluence, REMOTE_OVERRIDE_FLOOR);
-    const hasLocalMatch = localInfluence >= LOCAL_MATCH_THRESHOLD;
+    const remoteOverrides = strongestRemote.influence > Math.max(localInfluence + REMOTE_WIN_MARGIN, REMOTE_OVERRIDE_FLOOR);
+    const hasLocalMatch = localInfluence >= DIRECT_MATCH_THRESHOLD;
     const isBoundary = !hasLocalMatch && !remoteOverrides;
     boundaryAfter.push(isBoundary);
     anchorsByBoundary.push(hasLocalMatch
@@ -195,39 +174,93 @@ function makeTitleGroups(tabs, pageSummaries = new Map()) {
         if (tabIds.has(id)) anchorIds.add(id);
       }
     }
-    const anchorDocuments = [...anchorIds].map((id) => documentByTabId.get(id)).filter(Boolean);
-    const basis = anchorDocuments.length ? anchorDocuments : rangeTabs.map((tab) => documentByTabId.get(tab.id)).filter(Boolean);
-    const topicCounts = new Map();
-    const termWeights = new Map();
-    const termCounts = new Map();
-    for (const document of basis) {
-      for (const topic of document.topics) topicCounts.set(topic.id, (topicCounts.get(topic.id) || 0) + 1);
-      for (const token of new Set(document.tokens)) termCounts.set(token, (termCounts.get(token) || 0) + 1);
-      for (const [token, weight] of document.vector) termWeights.set(token, (termWeights.get(token) || 0) + weight);
+    const anchorIdsInRange = [...anchorIds].filter((id) => tabIds.has(id));
+    const anchorVectors = anchorIdsInRange.map((id) => embeddings.get(id)).filter(Boolean);
+    const nameBasis = anchorVectors.length ? anchorIdsInRange : rangeTabs.map((tab) => tab.id).filter((id) => embeddings.has(id));
+    const nameVectors = nameBasis.map((id) => embeddings.get(id));
+    let representativeId = nameBasis[0];
+    if (nameVectors.length > 1) {
+      const center = Array(nameVectors[0].length).fill(0);
+      for (const vector of nameVectors) vector.forEach((value, index) => { center[index] += value; });
+      const centerNorm = Math.sqrt(center.reduce((sum, value) => sum + value * value, 0)) || 1;
+      const normalizedCenter = center.map((value) => value / centerNorm);
+      representativeId = nameBasis.reduce((bestId, candidateId) =>
+        cosineSimilarity(embeddings.get(candidateId), normalizedCenter) > cosineSimilarity(embeddings.get(bestId), normalizedCenter)
+          ? candidateId : bestId, nameBasis[0]);
     }
-    const sharedTopics = TITLE_TOPICS
-      .filter((topic) => (topicCounts.get(topic.id) || 0) > 1)
-      .sort((left, right) => topicCounts.get(right.id) - topicCounts.get(left.id));
-    const sharedTerms = [...termWeights]
-      .filter(([token]) => termCounts.get(token) > 1)
-      .sort((left, right) => right[1] - left[1]);
-    const name = sharedTopics.length
-      ? sharedTopics.slice(0, 2).map((topic) => topic.label).join(" · ")
-      : (sharedTerms.length ? sharedTerms : [...termWeights].sort((left, right) => right[1] - left[1]))
-        .slice(0, 2).map(([token]) => token.charAt(0).toLocaleUpperCase() + token.slice(1)).join(" · ");
+    const representative = rangeTabs.find((tab) => tab.id === representativeId) || rangeTabs[0];
     return {
-      name: name || (rangeTabs.length === 1 ? rangeTabs[0].title : "Verwandte Tabs"),
-      topics: sharedTopics.map((topic) => topic.label),
+      name: representative?.title || "Ähnliche Seiten",
+      anchorTitles: anchorIdsInRange.map((id) => rangeTabs.find((tab) => tab.id === id)?.title).filter(Boolean),
       tabIds: rangeTabs.map((tab) => tab.id),
       titles: rangeTabs.map((tab) => tab.title || "Unbenannter Tab"),
       includedBetween: rangeTabs.length > 1 ? Math.max(0, rangeTabs.length - anchorIds.size) : 0,
       boundaryStart: first > 0,
-      boundaryEnd: last < orderedTabs.length - 1
+      boundaryEnd: last < orderedTabs.length - 1,
+      startPosition: first,
+      endPosition: last
     };
   });
-  lastUngroupedTabs = allSegments.filter((group) => group.tabIds.length === 1)
+
+  const mergedSegments = [];
+  const mergeThreshold = centeredScores ? 0.70 : 0.88;
+  const groupCenter = (group) => {
+    const vectors = group.tabIds.map((id) => embeddings.get(id)).filter(Boolean);
+    if (vectors.length === 0) return null;
+    const center = Array(vectors[0].length).fill(0);
+    for (const vector of vectors) vector.forEach((value, dimension) => { center[dimension] += value / vectors.length; });
+    const norm = Math.sqrt(center.reduce((sum, value) => sum + value * value, 0));
+    return norm > 1e-8 ? center.map((value) => value / norm) : null;
+  };
+  const groupSimilarity = (left, right) => {
+    const leftCenter = groupCenter(left);
+    const rightCenter = groupCenter(right);
+    let similarity = cosineSimilarity(leftCenter, rightCenter);
+    for (const leftId of left.tabIds) {
+      for (const rightId of right.tabIds) {
+        similarity = Math.max(similarity, cosineSimilarity(embeddings.get(leftId), embeddings.get(rightId)));
+      }
+    }
+    return similarity;
+  };
+  for (const group of allSegments) {
+    const previous = mergedSegments.at(-1);
+    const canMerge = previous
+      && previous.tabIds.length > 1
+      && group.tabIds.length > 1
+      && previous.endPosition + 1 === group.startPosition;
+    if (canMerge) {
+      const semanticMatch = groupSimilarity(previous, group) >= mergeThreshold;
+      const sharedTitleTerms = groupsShareDistinctTitleTerms(previous, group);
+      if (semanticMatch || sharedTitleTerms) {
+        const combinedIds = [...previous.tabIds, ...group.tabIds];
+        const combined = { ...previous, tabIds: combinedIds, titles: [...previous.titles, ...group.titles] };
+        const combinedCenter = groupCenter(combined);
+        const representativeId = combinedIds.reduce((bestId, candidateId) =>
+          cosineSimilarity(embeddings.get(candidateId), combinedCenter) > cosineSimilarity(embeddings.get(bestId), combinedCenter)
+            ? candidateId : bestId, combinedIds[0]);
+        combined.name = orderedTabs.find((tab) => tab.id === representativeId)?.title || previous.name;
+        combined.anchorTitles = [...new Set([...previous.anchorTitles, ...group.anchorTitles])];
+        combined.includedBetween = previous.includedBetween + group.includedBetween;
+        combined.boundaryEnd = group.boundaryEnd;
+        combined.endPosition = group.endPosition;
+        mergedSegments[mergedSegments.length - 1] = combined;
+        continue;
+      }
+    }
+    mergedSegments.push({ ...group });
+  }
+
+  lastUngroupedTabs = mergedSegments.filter((group) => group.tabIds.length === 1)
     .map((group) => ({ title: group.titles[0], index: orderedTabs.find((tab) => tab.id === group.tabIds[0])?.index ?? 0 }));
-  return allSegments.filter((group) => group.tabIds.length > 1);
+  lastGroupingDiagnostics = {
+    tabCount: orderedTabs.length,
+    embeddedCount: orderedTabs.filter((tab) => embeddings.has(tab.id)).length,
+    strongestAdjacent,
+    directThreshold: DIRECT_MATCH_THRESHOLD,
+    centeredScores
+  };
+  return mergedSegments.filter((group) => group.tabIds.length > 1);
 }
 
 function extractPageContext() {
@@ -296,14 +329,13 @@ function beginTitleAnalysis() {
   // Request only the currently open site origins, directly from this click.
   groupingStatus.textContent = `Bitte erlaube den Zugriff auf ${origins.length} derzeit offene Website${origins.length === 1 ? "" : "s"}; es werden nur kurze Textproben lokal ausgewertet.`;
   analyzeTitlesButton.disabled = true;
-  let permissionRequest;
-  try {
-    permissionRequest = chrome.permissions.request({ permissions: ["scripting"], origins });
-  } catch (error) {
-    console.error("Optional page access request failed:", error);
-    void createTitleGroupSuggestions(tabs, false);
-    return;
-  }
+  const permissionRequest = new Promise((resolve, reject) => {
+    chrome.permissions.request({ permissions: ["scripting"], origins }, (granted) => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message));
+      else resolve(granted);
+    });
+  });
   permissionRequest.then((granted) => createTitleGroupSuggestions(tabs, granted))
     .catch((error) => {
       console.error("Optional page access request failed:", error);
@@ -313,15 +345,46 @@ function beginTitleAnalysis() {
 
 async function createTitleGroupSuggestions(tabs, canReadPages) {
   groupingStatus.textContent = canReadPages
-    ? "Kurze Seitenkontexte werden gelesen und lokal verglichen …"
-    : "Seitentitel werden lokal verglichen …";
+    ? "Kurze Seitenkontexte werden gelesen; das lokale mehrsprachige Modell wird vorbereitet …"
+    : "Das lokale mehrsprachige Modell wird mit den Seitentiteln vorbereitet …";
   titleGroupsContainer.replaceChildren();
   ungroupedTabsContainer.replaceChildren();
   applyGroupsButton.disabled = true;
   analyzeTitlesButton.disabled = true;
   try {
     const pageSummaries = canReadPages ? await readPageContexts(tabs) : new Map();
-    proposedTitleGroups = makeTitleGroups(tabs, pageSummaries);
+    const analyzableTabs = tabs.filter((tab) => !tab.pinned && tab.title && typeof tab.id === "number");
+    const updateModelProgress = (event) => {
+      if (event.status === "progress" && Number.isFinite(event.progress)) {
+        groupingStatus.textContent = `Lade lokales Modell: ${Math.round(event.progress)}% …`;
+      } else if (event.status === "embedding") {
+        groupingStatus.textContent = `Vergleiche semantisch passende Seiten: ${event.completed}/${event.total} …`;
+      }
+    };
+    if (analyzableTabs.length === 0) {
+      proposedTitleGroups = [];
+      lastUngroupedTabs = [];
+      lastGroupingBoundaryCount = 0;
+      lastGroupingDiagnostics = { tabCount: 0, embeddedCount: 0, strongestAdjacent: 0 };
+    }
+    const titleVectors = analyzableTabs.length
+      ? await embedTexts(analyzableTabs.map((tab) => tab.title), updateModelProgress)
+      : [];
+    const contextTabs = analyzableTabs.filter((tab) => pageSummaries.has(tab.id));
+    const contextVectors = contextTabs.length
+      ? await embedTexts(contextTabs.map((tab) => pageSummaries.get(tab.id)), updateModelProgress)
+      : [];
+    const contextByTab = new Map(contextTabs.map((tab, index) => [tab.id, contextVectors[index]]));
+    const rawEmbeddings = new Map(analyzableTabs.map((tab, index) => {
+      const titleVector = titleVectors[index];
+      const contextVector = contextByTab.get(tab.id);
+      if (!contextVector) return [tab.id, titleVector];
+      const combined = titleVector.map((value, dimension) => value * 0.9 + contextVector[dimension] * 0.1);
+      const norm = Math.sqrt(combined.reduce((sum, value) => sum + value * value, 0)) || 1;
+      return [tab.id, combined.map((value) => value / norm)];
+    }));
+    const { vectors: embeddings, centered: centeredScores } = centerEmbeddingVectors(rawEmbeddings);
+    proposedTitleGroups = makeTitleGroups(tabs, embeddings, centeredScores);
 
     if (lastUngroupedTabs.length > 0) {
       const note = document.createElement("p");
@@ -332,10 +395,13 @@ async function createTitleGroupSuggestions(tabs, canReadPages) {
     const groupedCount = proposedTitleGroups.reduce((sum, group) => sum + group.tabIds.length, 0);
     const pinnedCount = tabs.filter((tab) => tab.pinned).length;
     const contextNote = canReadPages
-      ? `${pageSummaries.size} kurze Seitenproben lokal analysiert`
+      ? `${pageSummaries.size} kurze Seitenproben plus Seitentitel lokal analysiert`
       : "nur Seitentitel verwendet (Seitenzugriff nicht erteilt)";
-    const noGroupNote = proposedTitleGroups.length === 0 ? "Keine mehrteiligen Gruppen erkannt. " : "";
-    groupingStatus.textContent = `${noGroupNote}${proposedTitleGroups.length} Gruppen für ${groupedCount} Tabs · ${lastGroupingBoundaryCount} Grenze${lastGroupingBoundaryCount === 1 ? "" : "n"} · ${contextNote}${pinnedCount ? ` · ${pinnedCount} angeheftete Tabs bleiben außerhalb` : ""}`;
+    const noGroupNote = proposedTitleGroups.length === 0
+      ? `Keine mehrteiligen Gruppen erkannt (${lastGroupingDiagnostics.embeddedCount}/${lastGroupingDiagnostics.tabCount} Tabs eingebettet; stärkste Nachbarähnlichkeit ${Math.round(lastGroupingDiagnostics.strongestAdjacent * 100)}%, Schwelle ${Math.round((lastGroupingDiagnostics.directThreshold || 0.6) * 100)}%). `
+      : "";
+    const singleNote = lastUngroupedTabs.length ? ` · ${lastUngroupedTabs.length} Einzeltabs ungegruppiert` : "";
+    groupingStatus.textContent = `${noGroupNote}${proposedTitleGroups.length} Gruppen für ${groupedCount} Tabs · ${lastGroupingBoundaryCount} Grenze${lastGroupingBoundaryCount === 1 ? "" : "n"}${singleNote} · ${contextNote}${pinnedCount ? ` · ${pinnedCount} angeheftete Tabs bleiben außerhalb` : ""}`;
     proposedTitleGroups.forEach((group, index) => {
       const card = document.createElement("article");
       card.className = "suggested-group";
@@ -353,10 +419,10 @@ async function createTitleGroupSuggestions(tabs, canReadPages) {
       const titles = document.createElement("p");
       titles.className = "suggested-tabs";
       titles.textContent = group.titles.join(" · ");
-      if (group.topics.length > 0) {
+      if (group.anchorTitles.length > 1) {
         const relation = document.createElement("p");
         relation.className = "group-relation";
-        relation.textContent = `Themenbezug: ${group.topics.join(" · ")}`;
+        relation.textContent = `Semantische Anker: ${group.anchorTitles.slice(0, 2).join(" ↔ ")}`;
         card.append(label, input, relation, titles);
       } else {
         card.append(label, input, titles);
@@ -366,7 +432,8 @@ async function createTitleGroupSuggestions(tabs, canReadPages) {
     applyGroupsButton.disabled = proposedTitleGroups.length === 0;
   } catch (error) {
     proposedTitleGroups = [];
-    groupingStatus.textContent = "Gruppierungsvorschläge konnten nicht erstellt werden.";
+    const reason = error instanceof Error ? error.message : String(error);
+    groupingStatus.textContent = `Analyse fehlgeschlagen: ${reason.slice(0, 220)}`;
     console.error("Title-based grouping failed:", error);
   } finally {
     analyzeTitlesButton.disabled = false;
@@ -395,7 +462,7 @@ async function applyTitleGroups() {
       await chrome.tabGroups.update(groupId, { title: group.name.slice(0, 60), color: colors[index % colors.length] });
       applied += group.tabIds.length;
     }
-    groupingStatus.textContent = `${groups.length} Gruppen erstellt · ${applied} Tabs gruppiert. Nicht zugeordnete Tabs bleiben außerhalb.`;
+    groupingStatus.textContent = `${groups.length} Gruppen erstellt · ${applied} Tabs gruppiert. Einzeltabs bleiben ungegruppiert.`;
     proposedTitleGroups = [];
     titleGroupsContainer.replaceChildren();
   } catch (error) {
@@ -635,6 +702,11 @@ async function scanTabs() {
   closeSearchButton.disabled = true;
   closeStorageButton.disabled = true;
   closeDuplicatesButton.disabled = true;
+  analyzeTitlesButton.disabled = true;
+  applyGroupsButton.disabled = true;
+  proposedTitleGroups = [];
+  titleGroupsContainer.replaceChildren();
+  ungroupedTabsContainer.replaceChildren();
   try {
     const tabs = await chrome.tabs.query({});
     currentWindowSnapshot = await chrome.tabs.query({ currentWindow: true });

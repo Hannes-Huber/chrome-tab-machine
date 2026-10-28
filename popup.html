@@ -16,11 +16,12 @@
 
       <section class="grouping-tool" aria-labelledby="groupingTitle">
         <h2 id="groupingTitle">Tabs thematisch gruppieren</h2>
-        <p class="section-intro">Vergleicht Seitentitel und – nach deiner Freigabe – kleine Textproben offener Seiten. Pro Seite werden höchstens 850 Zeichen lokal ausgewertet; nichts wird übertragen. Ohne Freigabe werden nur Titel genutzt.</p>
-        <button id="analyzeTitles" class="secondary wide-button" type="button" disabled>Titel und Seitenkontext analysieren</button>
+        <p class="section-intro">Ein mehrsprachiges Satzmodell vergleicht die Bedeutung der Seitentitel und – nach deiner Freigabe – kurze Textproben. Das Modell läuft vollständig lokal; es gibt keine festgelegten Themen- oder Wortlisten und nichts wird übertragen. Pro Seite werden höchstens 850 Zeichen ausgewertet. Ohne Website-Freigabe werden nur Titel genutzt.</p>
+        <button id="analyzeTitles" class="secondary wide-button" type="button" disabled>Seiten semantisch analysieren</button>
         <div id="groupingStatus" class="status" role="status" aria-live="polite"></div>
         <section id="titleGroups" aria-label="Vorgeschlagene Tab-Gruppen"></section>
         <div id="ungroupedTabs" class="ungrouped-tabs"></div>
+        <p class="section-intro">Beim Anwenden werden bestehende Gruppen der nicht angehefteten Tabs in diesem Fenster aufgelöst. Einzeltabs bleiben ungegruppiert.</p>
         <button id="applyGroups" class="primary wide-button" type="button" disabled>Vorgeschlagene Gruppen anwenden</button>
       </section>
 
@@ -56,6 +57,6 @@
         <button id="closeDuplicates" class="secondary duplicate-button" type="button" disabled>Ausgewählte Duplikate schließen</button>
       </details>
     </main>
-    <script src="popup.js"></script>
+    <script type="module" src="popup.js"></script>
   </body>
 </html>

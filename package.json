@@ -1,0 +1,14 @@
+{
+  "name": "tab-organizer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.1"
+  },
+  "devDependencies": {
+    "vite": "^7.1.0"
+  }
+}
