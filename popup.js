@@ -26,6 +26,53 @@ let lastGroupingBoundaryCount = 0;
 let lastGroupingDiagnostics = { tabCount: 0, embeddedCount: 0, strongestAdjacent: 0 };
 analyzeTitlesButton.disabled = true;
 
+const OPENED_AT_KEY = "tabOpenedAtById";
+const OPEN_TIME_HALF_LIFE_MS = 8 * 60 * 1000;
+const OPEN_TIME_MATCH_THRESHOLD = 0.6;
+
+async function getTabOpenTimes(tabs, canReadHistory) {
+  let recorded = {};
+  try {
+    recorded = (await chrome.storage.session.get(OPENED_AT_KEY))[OPENED_AT_KEY] || {};
+  } catch (error) {
+    console.warn("Tab opening times are unavailable:", error);
+  }
+  const historyTimes = new Map();
+  if (canReadHistory) {
+    const urls = [...new Set(tabs.filter((tab) => !tab.pinned && tab.url && typeof tab.id === "number")
+      .flatMap((tab) => {
+        try {
+          const url = new URL(tab.url);
+          return url.protocol === "http:" || url.protocol === "https:" ? [tab.url] : [];
+        } catch {
+          return [];
+        }
+      }))];
+    for (let start = 0; start < urls.length; start += 10) {
+      const batch = urls.slice(start, start + 10);
+      const visits = await Promise.all(batch.map(async (url) => {
+        try {
+          const entries = await chrome.history.getVisits({ url });
+          const latest = entries.reduce((time, visit) => Math.max(time, visit.visitTime || 0), 0);
+          return [url, latest || null];
+        } catch {
+          return [url, null];
+        }
+      }));
+      for (const [url, time] of visits) if (time) historyTimes.set(url, time);
+    }
+  }
+  return new Map(tabs.filter((tab) => typeof tab.id === "number").map((tab) => {
+    const known = recorded[tab.id];
+    if (known && Number.isFinite(known.at)) return [tab.id, known];
+    const historyTime = historyTimes.get(tab.url);
+    if (historyTime) return [tab.id, { at: historyTime, confidence: 0.8 }];
+    return [tab.id, Number.isFinite(tab.lastAccessed)
+      ? { at: tab.lastAccessed, confidence: 0.3 }
+      : null];
+  }));
+}
+
 function cosineSimilarity(left, right) {
   if (!left || !right || left.length !== right.length) return 0;
   let dot = 0;
@@ -34,22 +81,52 @@ function cosineSimilarity(left, right) {
 }
 
 function titleTokens(title) {
-  return new Set((title || "").normalize("NFKC").toLocaleLowerCase()
-    .match(/[\p{L}\p{N}]{3,}/gu) || []);
+  const expanded = (title || "").normalize("NFKC")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLocaleLowerCase();
+  const tokens = expanded.match(/[\p{L}\p{N}]{4,}/gu) || [];
+  const normalized = new Set();
+  for (const token of tokens) {
+    let stem = token;
+    for (const suffix of ["ing", "ers", "er", "ed", "es", "s"]) {
+      if (token.endsWith(suffix) && token.length - suffix.length >= 4) {
+        stem = token.slice(0, -suffix.length);
+        break;
+      }
+    }
+    normalized.add(stem);
+  }
+  return normalized;
 }
 
-function titlesShareDistinctTerms(leftTitle, rightTitle) {
+function titlesShareDistinctTerms(leftTitle, rightTitle, termFrequency, corpusSize, timeAffinity = 0) {
   const leftTokens = titleTokens(leftTitle);
   const rightTokens = titleTokens(rightTitle);
   if (leftTokens.size < 2 || rightTokens.size < 2) return false;
-  const sharedCount = [...leftTokens].filter((token) => rightTokens.has(token)).length;
-  return sharedCount >= 2 && sharedCount / Math.min(leftTokens.size, rightTokens.size) >= 0.25;
+  const shared = [...leftTokens].filter((token) => rightTokens.has(token));
+  const overlap = shared.length / Math.min(leftTokens.size, rightTokens.size);
+  if (shared.length < 2 || overlap < 0.25) return false;
+  const rareLimit = Math.max(2, Math.ceil(corpusSize * 0.2));
+  const rareSharedCount = shared.filter((token) => (termFrequency.get(token) || 0) <= rareLimit).length;
+  return rareSharedCount >= 2 || (rareSharedCount >= 1 && timeAffinity >= OPEN_TIME_MATCH_THRESHOLD);
 }
 
-function groupsShareDistinctTitleTerms(leftGroup, rightGroup) {
-  for (const leftTitle of leftGroup.titles) {
-    for (const rightTitle of rightGroup.titles) {
-      if (titlesShareDistinctTerms(leftTitle, rightTitle)) return true;
+function temporalSimilarity(leftId, rightId, openTimes) {
+  const left = openTimes.get(leftId);
+  const right = openTimes.get(rightId);
+  if (!left || !right) return 0;
+  const elapsed = Math.abs(left.at - right.at);
+  const confidence = Math.sqrt((left.confidence || 0) * (right.confidence || 0));
+  return Math.exp(-elapsed / OPEN_TIME_HALF_LIFE_MS) * confidence;
+}
+
+function groupsShareDistinctTitleTerms(leftGroup, rightGroup, termFrequency, corpusSize, openTimes) {
+  for (let leftIndex = 0; leftIndex < leftGroup.titles.length; leftIndex += 1) {
+    for (let rightIndex = 0; rightIndex < rightGroup.titles.length; rightIndex += 1) {
+      const timeAffinity = temporalSimilarity(leftGroup.tabIds[leftIndex], rightGroup.tabIds[rightIndex], openTimes);
+      if (titlesShareDistinctTerms(
+        leftGroup.titles[leftIndex], rightGroup.titles[rightIndex], termFrequency, corpusSize, timeAffinity
+      )) return true;
     }
   }
   return false;
@@ -71,15 +148,24 @@ function centerEmbeddingVectors(embeddings) {
   return { vectors: centered, centered: true };
 }
 
-function makeTitleGroups(tabs, embeddings, centeredScores) {
+function makeTitleGroups(tabs, embeddings, centeredScores, openTimes) {
   const orderedTabs = tabs.filter((tab) => !tab.pinned).sort((left, right) => left.index - right.index);
+  const titledTabs = orderedTabs.filter((tab) => tab.title);
+  const corpusSize = titledTabs.length;
+  const termFrequency = new Map();
+  for (const tab of titledTabs) {
+    for (const token of titleTokens(tab.title)) termFrequency.set(token, (termFrequency.get(token) || 0) + 1);
+  }
   const boundaryAfter = [];
   const anchorsByBoundary = [];
-  const DIRECT_MATCH_THRESHOLD = centeredScores ? 0.34 : 0.60;
-  const REMOTE_AFFINITY_THRESHOLD = centeredScores ? 0.44 : 0.68;
-  const REMOTE_OVERRIDE_FLOOR = centeredScores ? 0.22 : 0.32;
-  const REMOTE_WIN_MARGIN = centeredScores ? 0.04 : 0.05;
+  const DIRECT_MATCH_THRESHOLD = centeredScores ? 0.60 : 0.74;
+  const REMOTE_AFFINITY_THRESHOLD = centeredScores ? 0.70 : 0.84;
+  const REMOTE_OVERRIDE_FLOOR = centeredScores ? 0.34 : 0.42;
+  const REMOTE_WIN_MARGIN = centeredScores ? 0.08 : 0.09;
   let strongestAdjacent = 0;
+  let weakestAdjacent = 1;
+  let localMatchCount = 0;
+  let remoteOverrideCount = 0;
   const boundaryCount = Math.max(0, orderedTabs.length - 1);
   let treeSize = 1;
   while (treeSize < boundaryCount) treeSize *= 2;
@@ -123,12 +209,21 @@ function makeTitleGroups(tabs, embeddings, centeredScores) {
     for (let right = left + 2; right < orderedTabs.length; right += 1) {
       const second = embeddings.get(orderedTabs[right].id);
       if (!second) continue;
-      const hasSharedTerms = titlesShareDistinctTerms(orderedTabs[left].title, orderedTabs[right].title);
-      const affinity = Math.max(cosineSimilarity(first, second), hasSharedTerms ? 0.82 : 0);
-      if (affinity < REMOTE_AFFINITY_THRESHOLD) continue;
-      const influence = affinity / Math.sqrt(right - left);
+      const leftTab = orderedTabs[left];
+      const rightTab = orderedTabs[right];
+      const baseAffinity = cosineSimilarity(first, second);
+      const timeAffinity = temporalSimilarity(leftTab.id, rightTab.id, openTimes);
+      const hasSharedTerms = titlesShareDistinctTerms(
+        leftTab.title, rightTab.title, termFrequency, corpusSize, timeAffinity
+      );
+      const affinity = baseAffinity + 0.12 * timeAffinity;
+      if (affinity < REMOTE_AFFINITY_THRESHOLD
+        && !(baseAffinity >= REMOTE_AFFINITY_THRESHOLD - 0.05 && timeAffinity >= OPEN_TIME_MATCH_THRESHOLD)
+        && !hasSharedTerms) continue;
+      const weightedAffinity = hasSharedTerms ? Math.max(affinity, 0.82) : affinity;
+      const influence = weightedAffinity / Math.sqrt(right - left);
       if (influence > 0) {
-        updateRemoteRange(left, right - 1, { influence, affinity, tabIds: [orderedTabs[left].id, orderedTabs[right].id] });
+        updateRemoteRange(left, right - 1, { influence, affinity: weightedAffinity, tabIds: [leftTab.id, rightTab.id] });
       }
     }
   }
@@ -138,16 +233,22 @@ function makeTitleGroups(tabs, embeddings, centeredScores) {
     const rightTab = orderedTabs[boundary + 1];
     const leftVector = embeddings.get(leftTab.id);
     const rightVector = embeddings.get(rightTab.id);
-    const hasSharedTerms = titlesShareDistinctTerms(leftTab.title, rightTab.title);
-    const localInfluence = Math.max(
-      leftVector && rightVector ? cosineSimilarity(leftVector, rightVector) : 0,
-      hasSharedTerms ? 0.82 : 0
+    const localTimeAffinity = temporalSimilarity(leftTab.id, rightTab.id, openTimes);
+    const hasSharedTerms = titlesShareDistinctTerms(
+      leftTab.title, rightTab.title, termFrequency, corpusSize, localTimeAffinity
     );
+    const baseLocalAffinity = leftVector && rightVector ? cosineSimilarity(leftVector, rightVector) : 0;
+    const localInfluence = baseLocalAffinity + 0.12 * localTimeAffinity;
     strongestAdjacent = Math.max(strongestAdjacent, localInfluence);
+    weakestAdjacent = Math.min(weakestAdjacent, localInfluence);
     const strongestRemote = remoteInfluenceAt(boundary);
 
     const remoteOverrides = strongestRemote.influence > Math.max(localInfluence + REMOTE_WIN_MARGIN, REMOTE_OVERRIDE_FLOOR);
-    const hasLocalMatch = localInfluence >= DIRECT_MATCH_THRESHOLD;
+    const hasLocalMatch = baseLocalAffinity >= DIRECT_MATCH_THRESHOLD
+      || (baseLocalAffinity >= DIRECT_MATCH_THRESHOLD - 0.05 && localTimeAffinity >= OPEN_TIME_MATCH_THRESHOLD)
+      || hasSharedTerms;
+    if (hasLocalMatch) localMatchCount += 1;
+    else if (remoteOverrides) remoteOverrideCount += 1;
     const isBoundary = !hasLocalMatch && !remoteOverrides;
     boundaryAfter.push(isBoundary);
     anchorsByBoundary.push(hasLocalMatch
@@ -203,7 +304,7 @@ function makeTitleGroups(tabs, embeddings, centeredScores) {
   });
 
   const mergedSegments = [];
-  const mergeThreshold = centeredScores ? 0.70 : 0.88;
+  const mergeThreshold = centeredScores ? 0.80 : 0.91;
   const groupCenter = (group) => {
     const vectors = group.tabIds.map((id) => embeddings.get(id)).filter(Boolean);
     if (vectors.length === 0) return null;
@@ -215,13 +316,15 @@ function makeTitleGroups(tabs, embeddings, centeredScores) {
   const groupSimilarity = (left, right) => {
     const leftCenter = groupCenter(left);
     const rightCenter = groupCenter(right);
-    let similarity = cosineSimilarity(leftCenter, rightCenter);
+    let temporalTotal = 0;
+    let pairCount = 0;
     for (const leftId of left.tabIds) {
       for (const rightId of right.tabIds) {
-        similarity = Math.max(similarity, cosineSimilarity(embeddings.get(leftId), embeddings.get(rightId)));
+        temporalTotal += temporalSimilarity(leftId, rightId, openTimes);
+        pairCount += 1;
       }
     }
-    return similarity;
+    return cosineSimilarity(leftCenter, rightCenter) + 0.08 * (pairCount ? temporalTotal / pairCount : 0);
   };
   for (const group of allSegments) {
     const previous = mergedSegments.at(-1);
@@ -231,7 +334,7 @@ function makeTitleGroups(tabs, embeddings, centeredScores) {
       && previous.endPosition + 1 === group.startPosition;
     if (canMerge) {
       const semanticMatch = groupSimilarity(previous, group) >= mergeThreshold;
-      const sharedTitleTerms = groupsShareDistinctTitleTerms(previous, group);
+      const sharedTitleTerms = groupsShareDistinctTitleTerms(previous, group, termFrequency, corpusSize, openTimes);
       if (semanticMatch || sharedTitleTerms) {
         const combinedIds = [...previous.tabIds, ...group.tabIds];
         const combined = { ...previous, tabIds: combinedIds, titles: [...previous.titles, ...group.titles] };
@@ -257,6 +360,9 @@ function makeTitleGroups(tabs, embeddings, centeredScores) {
     tabCount: orderedTabs.length,
     embeddedCount: orderedTabs.filter((tab) => embeddings.has(tab.id)).length,
     strongestAdjacent,
+    weakestAdjacent: orderedTabs.length > 1 ? weakestAdjacent : 0,
+    localMatchCount,
+    remoteOverrideCount,
     directThreshold: DIRECT_MATCH_THRESHOLD,
     centeredScores
   };
@@ -321,29 +427,31 @@ function beginTitleAnalysis() {
     }
   }))];
 
-  if (origins.length === 0) {
-    void createTitleGroupSuggestions(tabs, false);
-    return;
-  }
-
-  // Request only the currently open site origins, directly from this click.
-  groupingStatus.textContent = `Bitte erlaube den Zugriff auf ${origins.length} derzeit offene Website${origins.length === 1 ? "" : "s"}; es werden nur kurze Textproben lokal ausgewertet.`;
+  // Ask only after the user's click. History data is queried only for URLs
+  // already open in this window; page access stays optional as before.
+  groupingStatus.textContent = "Bitte bestätige optional den Verlaufs- und Website-Zugriff für diese Analyse …";
   analyzeTitlesButton.disabled = true;
+  const permissions = origins.length > 0 ? ["history", "scripting"] : ["history"];
   const permissionRequest = new Promise((resolve, reject) => {
-    chrome.permissions.request({ permissions: ["scripting"], origins }, (granted) => {
+    chrome.permissions.request({ permissions, ...(origins.length ? { origins } : {}) }, (granted) => {
       const error = chrome.runtime.lastError;
       if (error) reject(new Error(error.message));
       else resolve(granted);
     });
   });
-  permissionRequest.then((granted) => createTitleGroupSuggestions(tabs, granted))
-    .catch((error) => {
-      console.error("Optional page access request failed:", error);
-      void createTitleGroupSuggestions(tabs, false);
-    });
+  permissionRequest.then(async () => {
+    const [canReadHistory, canReadPages] = await Promise.all([
+      chrome.permissions.contains({ permissions: ["history"] }),
+      origins.length ? chrome.permissions.contains({ permissions: ["scripting"], origins }) : false
+    ]);
+    await createTitleGroupSuggestions(tabs, canReadPages, canReadHistory);
+  }).catch((error) => {
+    console.error("Optional analysis permissions request failed:", error);
+    void createTitleGroupSuggestions(tabs, false, false);
+  });
 }
 
-async function createTitleGroupSuggestions(tabs, canReadPages) {
+async function createTitleGroupSuggestions(tabs, canReadPages, canReadHistory = false) {
   groupingStatus.textContent = canReadPages
     ? "Kurze Seitenkontexte werden gelesen; das lokale mehrsprachige Modell wird vorbereitet …"
     : "Das lokale mehrsprachige Modell wird mit den Seitentiteln vorbereitet …";
@@ -353,6 +461,7 @@ async function createTitleGroupSuggestions(tabs, canReadPages) {
   analyzeTitlesButton.disabled = true;
   try {
     const pageSummaries = canReadPages ? await readPageContexts(tabs) : new Map();
+    const openTimes = await getTabOpenTimes(tabs, canReadHistory);
     const analyzableTabs = tabs.filter((tab) => !tab.pinned && tab.title && typeof tab.id === "number");
     const updateModelProgress = (event) => {
       if (event.status === "progress" && Number.isFinite(event.progress)) {
@@ -379,12 +488,12 @@ async function createTitleGroupSuggestions(tabs, canReadPages) {
       const titleVector = titleVectors[index];
       const contextVector = contextByTab.get(tab.id);
       if (!contextVector) return [tab.id, titleVector];
-      const combined = titleVector.map((value, dimension) => value * 0.9 + contextVector[dimension] * 0.1);
+      const combined = titleVector.map((value, dimension) => value * 0.95 + contextVector[dimension] * 0.05);
       const norm = Math.sqrt(combined.reduce((sum, value) => sum + value * value, 0)) || 1;
       return [tab.id, combined.map((value) => value / norm)];
     }));
     const { vectors: embeddings, centered: centeredScores } = centerEmbeddingVectors(rawEmbeddings);
-    proposedTitleGroups = makeTitleGroups(tabs, embeddings, centeredScores);
+    proposedTitleGroups = makeTitleGroups(tabs, embeddings, centeredScores, openTimes);
 
     if (lastUngroupedTabs.length > 0) {
       const note = document.createElement("p");
@@ -397,11 +506,18 @@ async function createTitleGroupSuggestions(tabs, canReadPages) {
     const contextNote = canReadPages
       ? `${pageSummaries.size} kurze Seitenproben plus Seitentitel lokal analysiert`
       : "nur Seitentitel verwendet (Seitenzugriff nicht erteilt)";
+    const observedOpenTimes = analyzableTabs.filter((tab) => openTimes.get(tab.id)?.confidence >= 1).length;
+    const historyOpenTimes = analyzableTabs.filter((tab) => openTimes.get(tab.id)?.confidence === 0.8).length;
+    const approximateOpenTimes = analyzableTabs.length - observedOpenTimes - historyOpenTimes;
+    const timeNote = `${observedOpenTimes} Öffnungszeitpunkte erfasst · ${historyOpenTimes} Verlauf · ${approximateOpenTimes} Näherungen`;
     const noGroupNote = proposedTitleGroups.length === 0
       ? `Keine mehrteiligen Gruppen erkannt (${lastGroupingDiagnostics.embeddedCount}/${lastGroupingDiagnostics.tabCount} Tabs eingebettet; stärkste Nachbarähnlichkeit ${Math.round(lastGroupingDiagnostics.strongestAdjacent * 100)}%, Schwelle ${Math.round((lastGroupingDiagnostics.directThreshold || 0.6) * 100)}%). `
       : "";
+    const singleGroupDiagnostic = proposedTitleGroups.length === 1
+      ? ` · Übergänge: ${lastGroupingDiagnostics.localMatchCount} direkte, ${lastGroupingDiagnostics.remoteOverrideCount} entfernte; Nachbarwerte ${Math.round(lastGroupingDiagnostics.weakestAdjacent * 100)}–${Math.round(lastGroupingDiagnostics.strongestAdjacent * 100)}%`
+      : "";
     const singleNote = lastUngroupedTabs.length ? ` · ${lastUngroupedTabs.length} Einzeltabs ungegruppiert` : "";
-    groupingStatus.textContent = `${noGroupNote}${proposedTitleGroups.length} Gruppen für ${groupedCount} Tabs · ${lastGroupingBoundaryCount} Grenze${lastGroupingBoundaryCount === 1 ? "" : "n"}${singleNote} · ${contextNote}${pinnedCount ? ` · ${pinnedCount} angeheftete Tabs bleiben außerhalb` : ""}`;
+    groupingStatus.textContent = `${noGroupNote}${proposedTitleGroups.length} Gruppen für ${groupedCount} Tabs · ${lastGroupingBoundaryCount} Grenze${lastGroupingBoundaryCount === 1 ? "" : "n"}${singleNote}${singleGroupDiagnostic} · ${contextNote} · ${timeNote}${pinnedCount ? ` · ${pinnedCount} angeheftete Tabs bleiben außerhalb` : ""}`;
     proposedTitleGroups.forEach((group, index) => {
       const card = document.createElement("article");
       card.className = "suggested-group";
