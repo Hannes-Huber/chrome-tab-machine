@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Such-Tabs & Duplikate",
+  "version": "1.2.0",
+  "description": "Listet Such- und File-Storage-Tabs zum Behalten oder Schließen auf.",
+  "permissions": ["tabs"],
+  "action": {
+    "default_title": "Tabs verwalten",
+    "default_popup": "popup.html"
+  }
+}

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Such- und Storage-Tabs</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="eyebrow">TAB-VERWALTUNG</div>
+        <h1>Tabs verwalten</h1>
+        <p class="intro">Such-Tabs und File-Storage-Seiten prüfen und auswählen, welche geöffnet bleiben.</p>
+      </header>
+
+      <div id="searchStatus" class="status" role="status" aria-live="polite">Such-Tabs werden geprüft …</div>
+      <section id="searchResults" aria-label="Suchbegriffe"></section>
+
+      <footer>
+        <button id="rescan" class="secondary" type="button">Erneut prüfen</button>
+        <button id="closeSearch" class="primary" type="button" disabled>Nicht markierte schließen</button>
+      </footer>
+      <p class="note">Nur markierte Such-Tabs bleiben geöffnet. Andere Tabs werden nicht verändert.</p>
+      <details class="storage-section" open>
+        <summary>File-Storage-Tabs</summary>
+        <p class="section-intro">Bekannte Speicherdienste und deine eigenen Domains. Markiere die Tabs, die geöffnet bleiben sollen.</p>
+        <div id="storageStatus" class="status" role="status" aria-live="polite">Storage-Tabs werden geprüft …</div>
+        <section id="storageResults" aria-label="File-Storage-Tabs"></section>
+        <footer class="storage-actions">
+          <button id="closeStorage" class="primary" type="button" disabled>Nicht markierte schließen</button>
+        </footer>
+        <form id="domainForm" class="domain-form">
+          <label for="domainInput">Weitere Storage-Domain hinzufügen</label>
+          <div class="domain-controls">
+            <input id="domainInput" type="text" placeholder="z. B. cloud.beispiel.de" autocomplete="off">
+            <button class="secondary" type="submit">Hinzufügen</button>
+          </div>
+          <div id="customDomains" class="custom-domains" aria-label="Eigene Domains"></div>
+        </form>
+      </details>
+      <details class="duplicates">
+        <summary>Doppelte Tabs prüfen</summary>
+        <div id="duplicateStatus" class="status" role="status" aria-live="polite">Tabs werden geprüft …</div>
+        <section id="duplicateResults" aria-label="Gefundene doppelte Tabs"></section>
+        <button id="closeDuplicates" class="secondary duplicate-button" type="button" disabled>Ausgewählte Duplikate schließen</button>
+      </details>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
